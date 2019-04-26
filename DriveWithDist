@@ -1,0 +1,206 @@
+#include "hFramework.h"
+#include "hCloudClient.h"
+#include "ros.h"
+#include "geometry_msgs/Twist.h"
+#include "geometry_msgs/PoseStamped.h"
+#include "sensor_msgs/BatteryState.h"
+#include "std_msgs/Bool.h"
+#include "sensor_msgs/Range.h"
+#include "tf/tf.h"
+#include "ROSbot.h"
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include "IMU.h"
+#include <stdio.h>
+
+IMU imu;
+
+//Sensor
+static const SensorType sensor_type = SENSOR_LASER;
+
+std::vector<float> ranges;
+
+float Vx, Vy, Inc, spd;
+float speedL, speedR;
+
+//std::tuple<float, float> spdtuple;
+
+int delay = 100;
+int delayprint = 100;
+int delayprint2;
+
+float speed;
+
+//PID values
+double _dt = 0.1;
+double _max = 100;
+double _min = -100;
+
+double _Kp = 300;
+double _Ki = 100;
+double _Kd = 130;
+double _pre_error, _integral;
+
+//Defining encModel constants
+uint16_t enc_res = 1400;
+int32_t enc_FR, enc_RR, enc_RL, enc_FL;
+int32_t enc_L, enc_R;           // encoder tics
+float sXEnc, sYEnc, vXEnc, vYEnc, gZEnc, yawEnc;
+float wheel_L_ang_pos, wheel_L_ang_vel, wheel_R_ang_pos, wheel_R_ang_vel;
+float robot_width = 0.235;    // meters
+float robot_length = 0.200; //meters
+float wheel_radius = 0.0425;  //meters
+
+//Setting motors right polarity
+void init(){
+    imu.begin();
+    hMot1.setMotorPolarity(Polarity::Reversed);
+    hMot1.setEncoderPolarity(Polarity::Reversed);
+    hMot2.setMotorPolarity(Polarity::Reversed);
+    hMot2.setEncoderPolarity(Polarity::Reversed);
+    platform.begin(&RPi);
+}
+
+
+void cloudTask() {
+	
+	//platform.begin(&RPi);
+	platform.ui.setProjectId("@@@PROJECT_ID@@@");
+
+	while (1) {
+		sys.delay(500);
+		LED3.toggle();
+	}
+}
+
+//Making speed change by keypress
+void onKeyEvent(KeyEventType type, KeyCode code){
+    switch (code) {
+    case KeyCode::Key_A:
+        if (type == KeyEventType::Pressed){
+            speed = 0.2;
+        }
+        break;
+    case KeyCode::Key_S:
+        if (type == KeyEventType::Pressed){
+            speed = 0;
+        }
+        break;
+         case KeyCode::Key_R:
+        if (type == KeyEventType::Pressed){
+            speed = -0.2;
+        }
+        break;
+    case KeyCode::Key_D:
+        if (type == KeyEventType::Pressed){
+            speed = 0.4;
+        }
+        break;
+    default: break;
+    }
+}
+
+double calculate( double setpoint, double pv )
+{
+    // Calculate error
+    double error = setpoint - pv;
+
+    // Proportional term
+    double Pout = _Kp * error;
+
+    // Integral term
+    _integral += error * _dt;
+    double Iout = _Ki * _integral;
+
+    // Derivative term
+    double derivative = (error - _pre_error) / _dt;
+    double Dout = _Kd * derivative;
+
+    // Calculate total output
+    double output = Pout + Iout + Dout;
+
+    // Restrict to max/min
+    if( output > _max )
+        output = _max;
+    else if( output < _min )
+        output = _min;
+
+    // Save error to previous error
+    _pre_error = error;
+
+    return output;
+}
+
+
+//using encoder model for vX and vY
+void encModel(){
+        enc_FR = hMot1.getEncoderCnt();
+        enc_RR = hMot2.getEncoderCnt();
+        enc_RL = hMot3.getEncoderCnt();
+        enc_FL = hMot4.getEncoderCnt();
+
+        enc_L = (enc_FL + enc_RL) / 2;
+        enc_R = (enc_FR + enc_RR) / 2;
+
+        wheel_L_ang_vel = ((2 * 3.14 * enc_L / enc_res) - wheel_L_ang_pos) / _dt;
+        wheel_R_ang_vel = ((2 * 3.14 * enc_R / enc_res) - wheel_R_ang_pos) / _dt;
+
+        wheel_L_ang_pos = 2 * 3.14 * enc_L / enc_res;
+        wheel_R_ang_pos = 2 * 3.14 * enc_R / enc_res;
+
+        gZEnc = (((wheel_R_ang_pos - wheel_L_ang_pos) * wheel_radius / robot_width) -
+                             yawEnc) / _dt;
+        yawEnc = (wheel_R_ang_pos - wheel_L_ang_pos) * wheel_radius / robot_width;
+
+        vXEnc = -(wheel_L_ang_vel * wheel_radius + gZEnc * robot_width / 2) * cos(yawEnc);
+        vYEnc = -(wheel_L_ang_vel * wheel_radius + gZEnc * robot_width / 2) *
+                      sin(yawEnc);
+}
+
+float Realspd(float Vx, float Vy){
+    float spd2;
+    spd2 = pow(Vx, 2) + pow(Vy, 2);
+    spd = pow(spd2, 0.5);
+    return Vx;
+}
+
+float SpdtoCon(float speed, float spd){
+    double inc = calculate(speed, spd);
+    float ftval = 1.5;
+    double spdInc = ftval * inc; //need to finetude value ftval to accurately finetune to certain angle
+    
+    speedL = speedL + spdInc;
+    speedR = speedR + spdInc;
+    return spdInc;
+}
+
+void setSpeed(){
+    hMot1.setPower(speedR);
+	hMot2.setPower(speedR);
+	hMot3.setPower(speedL);
+	hMot4.setPower(speedL);
+}
+
+void hMain()
+{
+    init();
+    sys.delay(2000);
+    sys.taskCreate(cloudTask);
+    platform.ui.onKeyEvent = onKeyEvent;
+    printf("start");
+    rosbot.initROSbot(sensor_type); //This line interferes with driving
+    
+    while(true){
+        encModel();
+        spd = Realspd(vXEnc, vYEnc);
+        Inc = SpdtoCon(speed, spd);
+        ranges = rosbot.getRanges(sensor_type);
+        printf("\r\nDistance %f", ranges[0]);
+        printf("\r\nSpeed %f", spd);
+        printf("\r\nVoltage %f", sys.getSupplyVoltage());
+        setSpeed();
+	    sys.delay(delay);
+    }
+    
+}
